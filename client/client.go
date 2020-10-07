@@ -50,12 +50,15 @@ type QQClient struct {
 	servers         []*net.TCPAddr
 	currServerIndex int
 	retryTimes      int
+	version         *versionInfo
 
 	syncCookie       []byte
 	pubAccountCookie []byte
 	msgCtrlBuf       []byte
 	ksid             []byte
 	t104             []byte
+	t174             []byte
+	t402             []byte // only for sms
 	t150             []byte
 	t149             []byte
 	t528             []byte
@@ -94,6 +97,7 @@ type loginSigInfo struct {
 	userStKey          []byte
 	userStWebSig       []byte
 	sKey               []byte
+	sKeyExpiredTime    int64
 	d2                 []byte
 	d2Key              []byte
 	wtSessionTicketKey []byte
@@ -121,6 +125,7 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 		OutGoingPacketSessionId: []byte{0x02, 0xB0, 0x5B, 0x8B},
 		decoders: map[string]func(*QQClient, uint16, []byte) (interface{}, error){
 			"wtlogin.login":                                decodeLoginResponse,
+			"wtlogin.exchange_emp":                         decodeExchangeEmpResponse,
 			"StatSvc.register":                             decodeClientRegisterResponse,
 			"StatSvc.ReqMSFOffline":                        decodeMSFOfflinePacket,
 			"StatSvc.GetDevLoginInfo":                      decodeDevListResponse,
@@ -146,19 +151,22 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 			"OidbSvc.0x6d6_2":                              decodeOIDB6d6Response,
 			"OidbSvc.0x88d_0":                              decodeGroupInfoResponse,
 			"OidbSvc.0xe07_0":                              decodeImageOcrResponse,
+			"OidbSvc.0xd79":                                decodeWordSegmentation,
 			"SummaryCard.ReqSummaryCard":                   decodeSummaryCardResponse,
 			"PttCenterSvr.ShortVideoDownReq":               decodePttShortVideoDownResponse,
 			"LightAppSvc.mini_app_info.GetAppInfoById":     decodeAppInfoResponse,
+			"OidbSvc.0x990":                                decodeTranslateResponse,
 		},
 		sigInfo:                &loginSigInfo{},
 		requestPacketRequestId: 1921334513,
 		groupSeq:               int32(rand.Intn(20000)),
 		friendSeq:              22911,
 		highwayApplyUpSeq:      77918,
-		ksid:                   []byte("|454001228437590|A8.2.7.27f6ea96"),
+		ksid:                   []byte(fmt.Sprintf("|%s|A8.2.7.27f6ea96", SystemDeviceInfo.IMEI)),
 		eventHandlers:          &eventHandlers{},
 		msgSvcCache:            utils.NewCache(time.Second * 15),
 		transCache:             utils.NewCache(time.Second * 15),
+		version:                genVersionInfo(SystemDeviceInfo.Protocol),
 		servers: []*net.TCPAddr{ // default servers
 			{IP: net.IP{42, 81, 169, 46}, Port: 8080},
 			{IP: net.IP{42, 81, 172, 81}, Port: 80},
@@ -206,6 +214,47 @@ func (c *QQClient) Login() (*LoginResponse, error) {
 		}
 	}
 	return &l, nil
+}
+
+// SubmitCaptcha send captcha to server
+func (c *QQClient) SubmitCaptcha(result string, sign []byte) (*LoginResponse, error) {
+	seq, packet := c.buildCaptchaPacket(result, sign)
+	rsp, err := c.sendAndWait(seq, packet)
+	if err != nil {
+		return nil, err
+	}
+	l := rsp.(LoginResponse)
+	if l.Success {
+		c.registerClient()
+		if !c.heartbeatEnabled {
+			c.startHeartbeat()
+		}
+	}
+	return &l, nil
+}
+
+func (c *QQClient) SubmitSNS(code string) (*LoginResponse, error) {
+	rsp, err := c.sendAndWait(c.buildSNSCodeSubmitPacket(code))
+	if err != nil {
+		return nil, err
+	}
+	l := rsp.(LoginResponse)
+	if l.Success {
+		c.registerClient()
+		if !c.heartbeatEnabled {
+			c.startHeartbeat()
+		}
+	}
+	return &l, nil
+}
+
+func (c *QQClient) RequestSNS() bool {
+	rsp, err := c.sendAndWait(c.buildSNSRequestPacket())
+	if err != nil {
+		c.Error("request sms error: %v", err)
+		return false
+	}
+	return rsp.(LoginResponse).Error == SNSNeededError
 }
 
 func (c *QQClient) GetVipInfo(target int64) (*VipInfo, error) {
@@ -256,29 +305,27 @@ func (c *QQClient) GetGroupHonorInfo(groupCode int64, honorType HonorType) (*Gro
 	return &ret, nil
 }
 
+func (c *QQClient) GetWordSegmentation(text string) ([]string, error) {
+	rsp, err := c.sendAndWait(c.buildWordSegmentationPacket([]byte(text)))
+	if err != nil {
+		return nil, err
+	}
+	if data, ok := rsp.([][]byte); ok {
+		var ret []string
+		for _, val := range data {
+			ret = append(ret, string(val))
+		}
+		return ret, nil
+	}
+	return nil, errors.New("decode error")
+}
+
 func (c *QQClient) GetSummaryInfo(target int64) (*SummaryCardInfo, error) {
 	rsp, err := c.sendAndWait(c.buildSummaryCardRequestPacket(target))
 	if err != nil {
 		return nil, err
 	}
 	return rsp.(*SummaryCardInfo), nil
-}
-
-// SubmitCaptcha send captcha to server
-func (c *QQClient) SubmitCaptcha(result string, sign []byte) (*LoginResponse, error) {
-	seq, packet := c.buildCaptchaPacket(result, sign)
-	rsp, err := c.sendAndWait(seq, packet)
-	if err != nil {
-		return nil, err
-	}
-	l := rsp.(LoginResponse)
-	if l.Success {
-		c.registerClient()
-		if !c.heartbeatEnabled {
-			c.startHeartbeat()
-		}
-	}
-	return &l, nil
 }
 
 // ReloadFriendList refresh QQClient.FriendList field via GetFriendList()
@@ -546,7 +593,7 @@ func (c *QQClient) sendGroupLongOrForwardMessage(groupCode int64, isLong bool, m
 		},
 	})
 	for i, ip := range rsp.Uint32UpIp {
-		err := c.highwayUploadImage(uint32(ip), int(rsp.Uint32UpPort[i]), rsp.MsgSig, body, 27)
+		err := c.highwayUpload(uint32(ip), int(rsp.Uint32UpPort[i]), rsp.MsgSig, body, 27)
 		if err == nil {
 			if !isLong {
 				var pv string
@@ -595,7 +642,7 @@ func (c *QQClient) UploadGroupImage(groupCode int64, img []byte) (*message.Group
 		goto ok
 	}
 	for i, ip := range rsp.UploadIp {
-		err := c.highwayUploadImage(uint32(ip), int(rsp.UploadPort[i]), rsp.UploadKey, img, 2)
+		err := c.highwayUpload(uint32(ip), int(rsp.UploadPort[i]), rsp.UploadKey, img, 2)
 		if err != nil {
 			continue
 		}
@@ -833,6 +880,10 @@ func (c *QQClient) SolveFriendRequest(req *NewFriendRequest, accept bool) {
 }
 
 func (c *QQClient) getCookies() string {
+	if c.sigInfo.sKeyExpiredTime < time.Now().Unix() {
+		c.Debug("skey expired. refresh...")
+		_, _ = c.sendAndWait(c.buildRequestTgtgtNopicsigPacket())
+	}
 	return fmt.Sprintf("uin=o%d; skey=%s;", c.Uin, c.sigInfo.sKey)
 }
 
@@ -936,6 +987,11 @@ func (c *QQClient) connect() error {
 
 func (c *QQClient) SetCustomServer(servers []*net.TCPAddr) {
 	c.servers = append(servers, c.servers...)
+}
+
+func (c *QQClient) SendGroupGift(groupCode, uin uint64, gift message.GroupGift) {
+	_, packet := c.sendGroupGiftPacket(groupCode, uin, gift)
+	_ = c.send(packet)
 }
 
 func (c *QQClient) registerClient() {
@@ -1090,7 +1146,7 @@ func (c *QQClient) startHeartbeat() {
 func (c *QQClient) doHeartbeat() {
 	if c.Online {
 		seq := c.nextSeq()
-		sso := packets.BuildSsoPacket(seq, uint32(SystemDeviceInfo.Protocol), "Heartbeat.Alive", SystemDeviceInfo.IMEI, []byte{}, c.OutGoingPacketSessionId, []byte{}, c.ksid)
+		sso := packets.BuildSsoPacket(seq, c.version.AppId, "Heartbeat.Alive", SystemDeviceInfo.IMEI, []byte{}, c.OutGoingPacketSessionId, []byte{}, c.ksid)
 		packet := packets.BuildLoginPacket(c.Uin, 0, []byte{}, sso, []byte{})
 		_, err := c.sendAndWait(seq, packet)
 		if err != nil {

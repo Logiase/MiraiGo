@@ -80,11 +80,54 @@ func decodeLoginResponse(c *QQClient, _ uint16, payload []byte) (interface{}, er
 	} // need captcha
 
 	if t == 160 {
+
+		if t174, ok := m[0x174]; ok { // 短信验证
+			c.t104 = m[0x104]
+			c.t174 = t174
+			c.t402 = m[0x402]
+			phone := func() string {
+				r := binary.NewReader(m[0x178])
+				return r.ReadStringLimit(int(r.ReadInt32()))
+			}()
+			if t204, ok := m[0x204]; ok { // 同时支持扫码验证 ?
+				return LoginResponse{
+					Success:      false,
+					Error:        SNSNeededError | UnsafeDeviceError,
+					VerifyUrl:    string(t204),
+					SMSPhone:     phone,
+					ErrorMessage: string(m[0x17e]),
+				}, nil
+			}
+			return LoginResponse{
+				Success:      false,
+				Error:        SNSNeededError,
+				SMSPhone:     phone,
+				ErrorMessage: string(m[0x17e]),
+			}, nil
+		}
+
+		if _, ok := m[0x17b]; ok { // 二次验证
+			c.t104 = m[0x104]
+			return LoginResponse{
+				Success: false,
+				Error:   SNSNeededError,
+			}, nil
+		}
+
+		if t204, ok := m[0x204]; ok { // 扫码验证
+			return LoginResponse{
+				Success:      false,
+				Error:        UnsafeDeviceError,
+				VerifyUrl:    string(t204),
+				ErrorMessage: "",
+			}, nil
+		}
+
+	}
+
+	if t == 162 {
 		return LoginResponse{
-			Success:      false,
-			Error:        UnsafeDeviceError,
-			VerifyUrl:    string(m[0x204]),
-			ErrorMessage: "",
+			Error: TooManySMSRequestError,
 		}, nil
 	}
 
@@ -124,6 +167,23 @@ func decodeClientRegisterResponse(_ *QQClient, _ uint16, payload []byte) (interf
 	request.ReadFrom(jce.NewJceReader(payload))
 	data := &jce.RequestDataVersion2{}
 	data.ReadFrom(jce.NewJceReader(request.SBuffer))
+	return nil, nil
+}
+
+// wtlogin.exchange_emp
+func decodeExchangeEmpResponse(c *QQClient, _ uint16, payload []byte) (interface{}, error) {
+	reader := binary.NewReader(payload)
+	cmd := reader.ReadUInt16()
+	t := reader.ReadByte()
+	reader.ReadUInt16()
+	m := reader.ReadTlvMap(2)
+	if t != 0 {
+		c.Error("exchange_emp error: %v", t)
+		return nil, nil
+	}
+	if cmd == 15 { // TODO: 免密登录
+		c.decodeT119R(m[0x119])
+	}
 	return nil, nil
 }
 
@@ -481,6 +541,7 @@ func decodeGroupMemberListResponse(_ *QQClient, _ uint16, payload []byte) (inter
 		l = append(l, &GroupMemberInfo{
 			Uin:                    m.MemberUin,
 			Nickname:               m.Nick,
+			Gender:                 m.Gender,
 			CardName:               m.Name,
 			Level:                  uint16(m.MemberLevel),
 			JoinTime:               m.JoinTime,
@@ -514,6 +575,7 @@ func decodeGroupMemberInfoResponse(c *QQClient, _ uint16, payload []byte) (inter
 	return &GroupMemberInfo{
 		Group:                  group,
 		Uin:                    rsp.MemInfo.Uin,
+		Gender:                 byte(rsp.MemInfo.Sex),
 		Nickname:               string(rsp.MemInfo.Nick),
 		CardName:               string(rsp.MemInfo.Card),
 		Level:                  uint16(rsp.MemInfo.Level),
@@ -549,7 +611,7 @@ func decodeGroupImageStoreResponse(_ *QQClient, _ uint16, payload []byte) (inter
 	}
 	if rsp.BoolFileExit {
 		if rsp.MsgImgInfo != nil {
-			return imageUploadResponse{IsExists: true, FileId: rsp.FileId, Width: rsp.MsgImgInfo.FileWidth, Height: rsp.MsgImgInfo.FileHeight}, nil
+			return imageUploadResponse{IsExists: true, FileId: rsp.Fid, Width: rsp.MsgImgInfo.FileWidth, Height: rsp.MsgImgInfo.FileHeight}, nil
 		}
 		return imageUploadResponse{IsExists: true, FileId: rsp.Fid}, nil
 	}
@@ -1038,6 +1100,22 @@ func decodeMultiApplyDownResponse(c *QQClient, _ uint16, payload []byte) (interf
 		return nil, err
 	}
 	return &mt, nil
+}
+
+// OidbSvc.0xd79
+func decodeWordSegmentation(_ *QQClient, _ uint16, payload []byte) (interface{}, error) {
+	pkg := oidb.OIDBSSOPkg{}
+	rsp := &oidb.D79RspBody{}
+	if err := proto.Unmarshal(payload, &pkg); err != nil {
+		return nil, err
+	}
+	if err := proto.Unmarshal(pkg.Bodybuffer, rsp); err != nil {
+		return nil, err
+	}
+	if rsp.Content != nil {
+		return rsp.Content.SliceContent, nil
+	}
+	return nil, errors.New("no word receive")
 }
 
 // OidbSvc.0x6d6_2

@@ -70,6 +70,8 @@ type (
 	}
 
 	ElementType int
+
+	GroupGift int
 )
 
 const (
@@ -85,6 +87,16 @@ const (
 	Video
 	LightApp
 	RedBag
+
+	SweetWink      GroupGift = 285
+	HappyCola      GroupGift = 289
+	LuckyBracelet  GroupGift = 290
+	Cappuccino     GroupGift = 299
+	CatWatch       GroupGift = 302
+	FleeceGloves   GroupGift = 307
+	RainbowCandy   GroupGift = 308
+	Stronger       GroupGift = 313
+	LoveMicrophone GroupGift = 367
 )
 
 func (s *Sender) IsAnonymous() bool {
@@ -294,15 +306,15 @@ func ToProtoElems(elems []IMessageElement, generalFlags bool) (r []*msg.Elem) {
 				CustomFace: &msg.CustomFace{
 					FilePath: e.Filename,
 					Md5:      e.Md5,
-					//Size:     e.Size,
-					Flag:    make([]byte, 4),
-					OldData: imgOld,
+					Size:     e.Size,
+					Flag:     make([]byte, 4),
+					OldData:  imgOld,
 				},
 			})
 		case *GroupImageElement:
 			r = append(r, &msg.Elem{
 				CustomFace: &msg.CustomFace{
-					//FileType: 66,
+					FileType: 66,
 					Useful:   1,
 					Origin:   1,
 					FileId:   int32(e.FileId),
